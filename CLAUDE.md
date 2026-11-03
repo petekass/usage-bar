@@ -47,7 +47,7 @@ UsageBar/
 
 ## API Endpoints
 
-- Claude: `api.anthropic.com/api/oauth/usage` (Bearer token from `~/.config/usagebar/token`, with unexpired `~/.claude/.credentials.json` as fallback)
+- Claude: `api.anthropic.com/api/oauth/usage`. Bearer token in this order: `~/.config/usagebar/token`, unexpired `~/.claude/.credentials.json`, then Claude Code's Keychain item `Claude Code-credentials`, read via `/usr/bin/security find-generic-password` (never `SecItemCopyMatching`: the item's ACL trusts `/usr/bin/security`, so only that path avoids authorization prompts). Never touch the refresh token.
 - Claude local fallback: `~/.claude/usage-cache.json` (fresh statusline data, no authentication required)
 - Codex: `chatgpt.com/backend-api/wham/usage` (Bearer token from `~/.codex/auth.json`)
 

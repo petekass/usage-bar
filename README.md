@@ -45,7 +45,7 @@ A lightweight macOS menu bar app that displays your Claude Code and OpenAI Codex
 ### Build from Source
 
 ```bash
-git clone https://github.com/peterflowset/usage-bar.git
+git clone https://github.com/petekass/usage-bar.git
 cd usage-bar
 swift build -c release
 cp .build/release/UsageBar /usr/local/bin/
@@ -60,33 +60,33 @@ swift build -c release
 
 ## Setup
 
-The app reads local usage data and optional API credentials from plain files:
+UsageBar needs no setup for Claude Code on macOS beyond being signed in to
+Claude Code.
 
 ### Claude Code
 
-Claude Code's statusline script writes live 5-hour and 7-day usage to
-`~/.claude/usage-cache.json`; UsageBar accepts entries up to 15 minutes old.
+UsageBar calls the Claude OAuth usage API with Claude Code's own access token,
+which Claude Code keeps in the login Keychain (`Claude Code-credentials`).
+UsageBar reads that item through `/usr/bin/security`, the same tool Claude Code
+uses to read and write it. The item's access list trusts that tool, so the read
+shows no authorization prompt, works the same for the app bundle and the
+`--cli` copy, and survives token rotations. UsageBar only uses the access token;
+refreshing it stays with Claude Code, so the data is live while any Claude Code
+session (terminal, IDE or SDK) keeps the login fresh.
 
-For live API data including model-scoped limits (Opus/Fable weekly), give
-UsageBar its own long-lived token. `claude setup-token` is interactive — it
-opens a browser and prints the token, so save it in a second step rather than
-redirecting its output:
+Other sources, in order of precedence:
 
-```bash
-claude setup-token                       # prints an sk-ant-oat01-… token
-mkdir -p ~/.config/usagebar && chmod 700 ~/.config/usagebar
-printf '%s' '<paste-token>' > ~/.config/usagebar/token
-chmod 600 ~/.config/usagebar/token
-```
+- `~/.config/usagebar/token` (0600): an optional dedicated token that overrides
+  the Keychain item.
+- An unexpired `~/.claude/.credentials.json`, where Claude Code stores
+  credentials on Linux.
+- `~/.claude/usage-cache.json`, written by the Claude Code statusline script
+  (see below); accepted up to 15 minutes old. This source has no model-scoped
+  rows and is only written while an interactive terminal session renders its
+  statusline.
 
-UsageBar never reads Claude Code's macOS Keychain item — the app bundle and the
-`--cli` copy have different code-signing identities, so any shared Keychain item
-makes one of them trigger an authorization prompt. A 0600 file avoids that, and
-matches how the Codex path already reads `~/.codex/auth.json`.
-
-If the token file is absent, UsageBar can also use an unexpired
-`~/.claude/.credentials.json`; without either, it runs on the statusline cache
-alone and simply omits the model-scoped rows.
+When no source is fresh, the panel keeps the last good data, dimmed and labelled
+"as of HH:mm" (with the date once it is older than a day).
 
 ### Codex (OpenAI)
 
@@ -118,7 +118,7 @@ The cache file must follow this format:
 
 ## How It Works
 
-1. Calls the Claude OAuth usage API when a file-based token is available
+1. Calls the Claude OAuth usage API with Claude Code's Keychain token (or a token file)
 2. Falls back to fresh Claude usage from `~/.claude/usage-cache.json`
 3. Reads Codex OAuth tokens from `~/.codex/auth.json`
 4. Calls the Codex usage API: `chatgpt.com/backend-api/wham/usage`

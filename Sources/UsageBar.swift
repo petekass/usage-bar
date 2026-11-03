@@ -1,9 +1,20 @@
 import SwiftUI
 import AppKit
+import os
 
 // MARK: - Models
 
 let usageStalenessThreshold: TimeInterval = 300
+
+/// "as of" label for stale data; adds the date once it is older than a day,
+/// so a snapshot from last week doesn't read like one from last night.
+func staleLabel(_ d: Date, now: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = now.timeIntervalSince(d) > 86_400 ? "MMM d, HH:mm" : "HH:mm"
+    return "as of \(f.string(from: d))"
+}
+
+private let authLog = Logger(subsystem: "UsageBar", category: "auth")
 
 struct ModelLimit: Codable {
     let name: String
@@ -173,7 +184,8 @@ class UsageAPI {
 
         // Do not let an older API result reintroduce model-scoped limits when
         // this process can only serve the auth-free statusline source.
-        if fetchClaudeAccessToken().token == nil,
+        let auth = fetchClaudeAccessToken()
+        if auth.token == nil,
            let local = fetchClaudeFromStatuslineCache(),
            let fetchedAt = local.fetchedAt {
             state.claude = local
@@ -182,7 +194,8 @@ class UsageAPI {
         } else {
             state.claude = await fetchProvider(
                 cached: cache?.claude, lastGood: &lastGoodClaude, backoffUntil: &claudeBackoffUntil,
-                fetch: fetchClaude, store: { c in self.writeCache { $0.claude = c } })
+                fetch: { await self.fetchClaude(auth: auth) },
+                store: { c in self.writeCache { $0.claude = c } })
         }
         state.codex = await fetchProvider(
             cached: cache?.codex, lastGood: &lastGoodCodex, backoffUntil: &codexBackoffUntil,
@@ -245,9 +258,8 @@ class UsageAPI {
         }
     }
 
-    private func fetchClaude() async -> ProviderUsage {
+    private func fetchClaude(auth: (token: String?, error: String?)) async -> ProviderUsage {
         var u = ProviderUsage()
-        let auth = fetchClaudeAccessToken()
         guard let token = auth.token else {
             u.error = auth.error ?? "No auth"
             return fetchClaudeFromStatuslineCache() ?? u
@@ -315,9 +327,7 @@ class UsageAPI {
     }
 
     private func fetchClaudeAccessToken() -> (token: String?, error: String?) {
-        // The app bundle and CLI have different signing identities, so sharing a
-        // Keychain item prompts for authorization. A 0600 file avoids that
-        // asymmetry and matches the Codex auth-file design.
+        // Optional override: a dedicated token in a 0600 file.
         let tokenPath = NSHomeDirectory() + "/.config/usagebar/token"
         if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -325,15 +335,67 @@ class UsageAPI {
             return (token, nil)
         }
 
+        var error = "No auth"
+        // Linux-style plaintext credentials, if Claude Code ever wrote them here.
         let path = NSHomeDirectory() + "/.claude/.credentials.json"
-        guard let data = FileManager.default.contents(atPath: path) else {
-            return (nil, "No auth")
+        if let data = FileManager.default.contents(atPath: path) {
+            if let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) {
+                if !creds.isExpired { return (creds.claudeAiOauth.accessToken, nil) }
+                error = "Auth expired"
+            } else {
+                error = "Auth format"
+            }
         }
-        guard let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
-            return (nil, "Auth format")
+
+        // macOS default: Claude Code's own login Keychain item.
+        if let creds = readClaudeKeychainCredentials() {
+            if !creds.isExpired { return (creds.claudeAiOauth.accessToken, nil) }
+            error = "Auth expired"
         }
-        guard !creds.isExpired else { return (nil, "Auth expired") }
-        return (creds.claudeAiOauth.accessToken, nil)
+        return (nil, error)
+    }
+
+    /// Reads Claude Code's OAuth credentials from the login Keychain.
+    ///
+    /// Claude Code itself reads and writes this item through /usr/bin/security,
+    /// so the item's access list trusts that tool. Asking the same tool for it
+    /// therefore shows no authorization prompt, whichever binary spawns it (app
+    /// bundle or --cli copy), and keeps working across token rotations. A direct
+    /// SecItemCopyMatching call is checked against UsageBar's own code identity
+    /// instead, which is what prompted on every rotation before.
+    /// Only the access token is used; the refresh flow stays with Claude Code.
+    private func readClaudeKeychainCredentials() -> ClaudeCredentials? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-a", NSUserName(), "-w", "-s", "Claude Code-credentials"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do {
+            try p.run()
+        } catch {
+            authLog.error("could not run /usr/bin/security: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+        // A locked keychain could make security wait on UI; never stall a refresh on it.
+        let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: watchdog)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        watchdog.cancel()
+
+        guard p.terminationStatus == 0 else {
+            authLog.info("Keychain lookup exited with status \(p.terminationStatus, privacy: .public)")
+            return nil
+        }
+        guard let text = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: Data(text.utf8)) else {
+            authLog.error("Keychain item is not in the expected credentials format")
+            return nil
+        }
+        return creds
     }
 
     private func fetchCodex() async -> ProviderUsage {
@@ -418,7 +480,7 @@ struct ProviderRow: View {
             HStack(spacing: 4) {
                 Text(name).font(.system(size: 12, weight: .semibold))
                 if isStale, let fetchedAt = usage.fetchedAt {
-                    Text("as of \(time(fetchedAt))")
+                    Text(staleLabel(fetchedAt, now: now))
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                 }
@@ -441,10 +503,6 @@ struct ProviderRow: View {
                 }
             }.opacity(isStale ? 0.45 : 1)
         }
-    }
-
-    func time(_ d: Date) -> String {
-        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
     }
 }
 
@@ -605,8 +663,7 @@ enum CLI {
         let stale = u.fetchedAt.map { now.timeIntervalSince($0) > usageStalenessThreshold } ?? false
         let asOf: String
         if stale, let fetchedAt = u.fetchedAt {
-            let f = DateFormatter(); f.dateFormat = "HH:mm"
-            asOf = "\u{1B}[2m (as of \(f.string(from: fetchedAt)))\u{1B}[0m"
+            asOf = "\u{1B}[2m (\(staleLabel(fetchedAt, now: now)))\u{1B}[0m"
         } else {
             asOf = ""
         }
