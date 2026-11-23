@@ -2,7 +2,7 @@
 
 ## Overview
 
-macOS menu bar app displaying Claude Code and Codex usage limits. Native Swift/SwiftUI app using NSPanel for the popup.
+macOS menu bar app displaying Claude Code, Codex, and Gemini usage limits. Native Swift/SwiftUI app using NSPanel for the popup.
 
 ## Build Commands
 
@@ -50,6 +50,8 @@ UsageBar/
 - Claude: `api.anthropic.com/api/oauth/usage`. Bearer token in this order: `~/.config/usagebar/token`, unexpired `~/.claude/.credentials.json`, then Claude Code's Keychain item `Claude Code-credentials`, read via `/usr/bin/security find-generic-password` (never `SecItemCopyMatching`: the item's ACL trusts `/usr/bin/security`, so only that path avoids authorization prompts). Never touch the refresh token.
 - Claude local fallback: `~/.claude/usage-cache.json` (fresh statusline data, no authentication required)
 - Codex: `chatgpt.com/backend-api/wham/usage` (Bearer token from `~/.codex/auth.json`)
+- Gemini: `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` (5h, 7d, and model-scoped limits such as Argon; requires `User-Agent: antigravity/acp/...`) with fallback to `retrieveUserQuota` (free tier / Gemini CLI). Bearer token in this order: `~/.config/usagebar/gemini-token`, unexpired T3 Antigravity token `~/.t3/userdata/providers/antigravity/*/antigravity-acp/antigravity-oauth-token`, Antigravity CLI Keychain item (`-s gemini -a antigravity`, read via `/usr/bin/security`), then `~/.gemini/oauth_creds.json`. When every Antigravity access token is expired, UsageBar mints its own from the Antigravity refresh token (`oauth2.googleapis.com/token`, client from `~/.config/usagebar/gemini-oauth-client.json`, never committed: the repo is public) and keeps it in memory only; never write back to T3's file or the Keychain. Google does not rotate the refresh token on this grant, so T3 and `agy` stay logged in. Claude and Codex rotate refresh tokens, so their refresh flow stays with Claude Code / Codex.
+- When a fetch fails, the last good data stays visible with a runtime-only `staleReason` ("Auth expired", "Rate limit", ...) next to the "as of" label; it is never written to the shared cache.
 
 ## Code Style
 

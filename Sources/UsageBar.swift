@@ -32,6 +32,9 @@ struct ProviderUsage: Codable {
     var error: String?
     var fetchedAt: Date?
     var shouldBackoff = false
+    /// Why the shown data is not from this refresh (e.g. "Auth expired").
+    /// Runtime only, never written to the shared cache.
+    var staleReason: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionPercent, sessionReset, weeklyPercent, weeklyReset, modelLimits, error, fetchedAt
@@ -48,11 +51,13 @@ struct CachedProvider: Codable {
 struct UsageCache: Codable {
     var claude: CachedProvider?
     var codex: CachedProvider?
+    var gemini: CachedProvider?
 }
 
 struct AppState {
     var claude = ProviderUsage()
     var codex = ProviderUsage()
+    var gemini = ProviderUsage()
     var lastUpdated: Date?
 }
 
@@ -161,6 +166,82 @@ struct CodexUsageResponse: Codable {
     }
 }
 
+// MARK: - Gemini API
+
+struct AntigravityCredentials: Codable {
+    struct Token: Codable {
+        let accessToken: String
+        let expiry: String?
+        let refreshToken: String?
+        enum CodingKeys: String, CodingKey {
+            case accessToken = "access_token"
+            case expiry
+            case refreshToken = "refresh_token"
+        }
+    }
+    let token: Token
+}
+
+/// Antigravity's installed-app OAuth client, kept outside the repo in
+/// ~/.config/usagebar/gemini-oauth-client.json (0600).
+struct GoogleOAuthClient: Codable {
+    let clientId: String
+    let clientSecret: String
+    enum CodingKeys: String, CodingKey { case clientId = "client_id"; case clientSecret = "client_secret" }
+}
+
+struct GoogleTokenResponse: Codable {
+    let accessToken: String
+    let expiresIn: Double?
+    enum CodingKeys: String, CodingKey { case accessToken = "access_token"; case expiresIn = "expires_in" }
+}
+
+struct GeminiAuth {
+    var token: String?
+    var useDailyEndpoint: Bool
+    var error: String?
+    /// Refresh token of the source the access token came from, for a retry after a 401.
+    var refreshToken: String?
+}
+
+struct GeminiCLICredentials: Codable {
+    let accessToken: String
+    let expiryDate: Int64?
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case expiryDate = "expiry_date"
+    }
+
+    var isExpired: Bool {
+        guard let exp = expiryDate else { return false }
+        return Double(exp) / 1000 < Date().timeIntervalSince1970
+    }
+}
+
+struct GeminiQuotaResponse: Codable {
+    struct Bucket: Codable {
+        let modelId: String?
+        let remainingFraction: Double?
+        let resetTime: String?
+    }
+    let buckets: [Bucket]?
+}
+
+struct GeminiQuotaSummaryResponse: Codable {
+    struct Group: Codable {
+        struct Bucket: Codable {
+            let bucketId: String?
+            let displayName: String?
+            let window: String?
+            let remainingFraction: Double?
+            let resetTime: String?
+        }
+        let displayName: String?
+        let buckets: [Bucket]?
+    }
+    let groups: [Group]?
+}
+
 // MARK: - API Client
 
 class UsageAPI {
@@ -168,8 +249,13 @@ class UsageAPI {
 
     private var lastGoodClaude: ProviderUsage?
     private var lastGoodCodex: ProviderUsage?
+    private var lastGoodGemini: ProviderUsage?
     private var claudeBackoffUntil = Date.distantPast
     private var codexBackoffUntil = Date.distantPast
+    private var geminiBackoffUntil = Date.distantPast
+    /// Access token UsageBar minted itself from Antigravity's refresh token.
+    /// Kept in memory only; T3's file and the Keychain item stay untouched.
+    private var geminiRefreshed: (token: String, expiry: Date, refreshToken: String)?
 
     private let cacheURL = URL(fileURLWithPath: NSHomeDirectory() + "/.cache/usagebar-state.json")
     // Serve from the shared cache while it is fresher than this, so N running
@@ -200,6 +286,9 @@ class UsageAPI {
         state.codex = await fetchProvider(
             cached: cache?.codex, lastGood: &lastGoodCodex, backoffUntil: &codexBackoffUntil,
             fetch: fetchCodex, store: { c in self.writeCache { $0.codex = c } })
+        state.gemini = await fetchProvider(
+            cached: cache?.gemini, lastGood: &lastGoodGemini, backoffUntil: &geminiBackoffUntil,
+            fetch: fetchGemini, store: { c in self.writeCache { $0.gemini = c } })
 
         return state
     }
@@ -220,6 +309,7 @@ class UsageAPI {
         // Backing off after a 429 — show the best data we have.
         if now < backoffUntil, var usage = lastGood ?? cached?.usage {
             usage.fetchedAt = usage.fetchedAt ?? cached?.fetchedAt
+            usage.staleReason = "Rate limit"
             return usage
         }
 
@@ -235,6 +325,7 @@ class UsageAPI {
         // Transient errors keep the last good data (in-memory or from disk).
         if var usage = lastGood ?? cached?.usage {
             usage.fetchedAt = usage.fetchedAt ?? cached?.fetchedAt
+            usage.staleReason = fetched.error
             return usage
         }
         return fetched
@@ -365,33 +456,10 @@ class UsageAPI {
     /// instead, which is what prompted on every rotation before.
     /// Only the access token is used; the refresh flow stays with Claude Code.
     private func readClaudeKeychainCredentials() -> ClaudeCredentials? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-a", NSUserName(), "-w", "-s", "Claude Code-credentials"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        p.standardInput = FileHandle.nullDevice
-        do {
-            try p.run()
-        } catch {
-            authLog.error("could not run /usr/bin/security: \(error.localizedDescription, privacy: .public)")
+        guard let text = runSecurityFindPassword(service: "Claude Code-credentials", account: NSUserName()) else {
             return nil
         }
-        // A locked keychain could make security wait on UI; never stall a refresh on it.
-        let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: watchdog)
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        watchdog.cancel()
-
-        guard p.terminationStatus == 0 else {
-            authLog.info("Keychain lookup exited with status \(p.terminationStatus, privacy: .public)")
-            return nil
-        }
-        guard let text = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: Data(text.utf8)) else {
+        guard let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: Data(text.utf8)) else {
             authLog.error("Keychain item is not in the expected credentials format")
             return nil
         }
@@ -456,6 +524,343 @@ class UsageAPI {
         return u
     }
 
+    private func fetchGemini() async -> ProviderUsage {
+        var auth = await fetchGeminiAccessToken()
+        var u = await fetchGeminiUsage(auth: auth)
+        // Token revoked or expired early: mint a fresh one once and retry.
+        if u.error == "API 401", let rt = auth.refreshToken {
+            geminiRefreshed = nil
+            let r = await refreshGeminiToken(rt)
+            if let fresh = r.token {
+                auth.token = fresh
+                u = await fetchGeminiUsage(auth: auth)
+            } else {
+                u.error = r.error ?? u.error
+            }
+        }
+        return u
+    }
+
+    private func fetchGeminiUsage(auth: GeminiAuth) async -> ProviderUsage {
+        var u = ProviderUsage()
+        guard let token = auth.token else {
+            u.error = auth.error ?? "No auth"
+            return u
+        }
+
+        let base = auth.useDailyEndpoint
+            ? "https://daily-cloudcode-pa.googleapis.com"
+            : "https://cloudcode-pa.googleapis.com"
+
+        // Primary: retrieveUserQuotaSummary returns both 5h and 7d (weekly) buckets
+        // plus model-scoped limits (e.g. Gemini 4 Argon). Requires the ACP/CLI
+        // User-Agent format or the backend omits native Gemini groups.
+        if auth.useDailyEndpoint, let summary = await fetchGeminiQuotaSummary(base: base, token: token) {
+            if summary.error == nil || summary.error == "Rate limit" {
+                return summary
+            }
+        }
+
+        // Fallback: retrieveUserQuota (used by free-tier / Gemini CLI accounts).
+        var req = makeGeminiRequest(url: "\(base)/v1internal:retrieveUserQuota", token: token)
+        req.httpBody = Data("{}".utf8)
+
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else {
+                u.error = "Network"
+                return u
+            }
+            guard http.statusCode == 200 else {
+                u.error = http.statusCode == 429 ? "Rate limit" : "API \(http.statusCode)"
+                return u
+            }
+            let r = try JSONDecoder().decode(GeminiQuotaResponse.self, from: data)
+            let now = Date()
+            let weeklyThreshold: TimeInterval = auth.useDailyEndpoint ? 21_600 : 90_000
+
+            var bestSession: (pct: Double, reset: Date?)?
+            var bestWeekly: (pct: Double, reset: Date?)?
+
+            for b in r.buckets ?? [] {
+                guard let id = b.modelId, id.lowercased().hasPrefix("gemini-") else { continue }
+                let reset = b.resetTime.flatMap(parseISO)
+                guard b.remainingFraction != nil || reset != nil else { continue }
+                // Proto3 JSON omits 0.0; a bucket with resetTime and no remainingFraction is exhausted.
+                let remaining = b.remainingFraction ?? 0.0
+                let used = min(max((1.0 - remaining) * 100.0, 0), 100)
+                let isWeekly = reset.map { $0.timeIntervalSince(now) > weeklyThreshold } ?? false
+
+                if isWeekly {
+                    if bestWeekly == nil || used > bestWeekly!.pct ||
+                        (used == bestWeekly!.pct && (reset ?? .distantFuture) < (bestWeekly!.reset ?? .distantFuture)) {
+                        bestWeekly = (used, reset)
+                    }
+                } else {
+                    if bestSession == nil || used > bestSession!.pct ||
+                        (used == bestSession!.pct && (reset ?? .distantFuture) < (bestSession!.reset ?? .distantFuture)) {
+                        bestSession = (used, reset)
+                    }
+                }
+            }
+
+            if let s = bestSession {
+                u.sessionPercent = s.pct
+                u.sessionReset = s.reset
+            }
+            if let w = bestWeekly {
+                u.weeklyPercent = w.pct
+                u.weeklyReset = w.reset
+            }
+            guard u.sessionPercent != nil || u.weeklyPercent != nil else {
+                u.error = "No data"
+                return u
+            }
+            u.fetchedAt = now
+        } catch {
+            u.error = "Error"
+        }
+        return u
+    }
+
+    private func fetchGeminiQuotaSummary(base: String, token: String) async -> ProviderUsage? {
+        var req = makeGeminiRequest(url: "\(base)/v1internal:retrieveUserQuotaSummary", token: token)
+        req.httpBody = Data("{}".utf8)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return nil }
+            if http.statusCode == 429 {
+                var u = ProviderUsage()
+                u.error = "Rate limit"
+                return u
+            }
+            guard http.statusCode == 200 else { return nil }
+
+            let r = try JSONDecoder().decode(GeminiQuotaSummaryResponse.self, from: data)
+            var u = ProviderUsage()
+            let now = Date()
+
+            for group in r.groups ?? [] {
+                let buckets = group.buckets ?? []
+                let groupName = group.displayName ?? ""
+                let isGeminiGroup = groupName.localizedCaseInsensitiveContains("gemini")
+                    || buckets.contains { ($0.bucketId ?? "").lowercased().hasPrefix("gemini") }
+                guard isGeminiGroup else { continue }
+
+                let isPrimaryGroup = buckets.contains {
+                    let id = ($0.bucketId ?? "").lowercased()
+                    return id == "gemini-5h" || id == "gemini-weekly"
+                } || groupName.lowercased() == "gemini models"
+
+                if isPrimaryGroup {
+                    for b in buckets {
+                        let reset = b.resetTime.flatMap(parseISO)
+                        guard b.remainingFraction != nil || reset != nil else { continue }
+                        let used = min(max((1.0 - (b.remainingFraction ?? 0.0)) * 100.0, 0), 100)
+                        let window = (b.window ?? "").lowercased()
+                        let id = (b.bucketId ?? "").lowercased()
+                        if window == "weekly" || id.contains("weekly") {
+                            u.weeklyPercent = used
+                            u.weeklyReset = reset
+                        } else if window == "5h" || id.contains("5h") {
+                            u.sessionPercent = used
+                            u.sessionReset = reset
+                        }
+                    }
+                } else {
+                    // Model-scoped Gemini quota group (e.g. "Gemini 4 Argon").
+                    let short = groupName.count > 7
+                        ? String(groupName.split(separator: " ").last ?? Substring(groupName))
+                        : groupName
+                    guard !short.isEmpty else { continue }
+                    if let b = buckets.first(where: { ($0.window ?? "").lowercased() == "weekly" }) ?? buckets.first {
+                        let reset = b.resetTime.flatMap(parseISO)
+                        guard b.remainingFraction != nil || reset != nil else { continue }
+                        let used = min(max((1.0 - (b.remainingFraction ?? 0.0)) * 100.0, 0), 100)
+                        u.modelLimits.append(ModelLimit(name: short, percent: used, reset: reset))
+                    }
+                }
+            }
+
+            guard u.sessionPercent != nil || u.weeklyPercent != nil || !u.modelLimits.isEmpty else {
+                return nil
+            }
+            u.fetchedAt = now
+            return u
+        } catch {
+            return nil
+        }
+    }
+
+    private func makeGeminiRequest(url: String, token: String) -> URLRequest {
+        var req = URLRequest(url: URL(string: url)!)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("antigravity/acp/1.5.13", forHTTPHeaderField: "User-Agent")
+        return req
+    }
+
+    private func fetchGeminiAccessToken() async -> GeminiAuth {
+        // Optional override: a dedicated token in a 0600 file.
+        let tokenPath = NSHomeDirectory() + "/.config/usagebar/gemini-token"
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !token.isEmpty {
+            return GeminiAuth(token: token, useDailyEndpoint: true)
+        }
+
+        var error = "No auth"
+        // Treat tokens that expire within a minute as expired already.
+        let cutoff = Date().addingTimeInterval(60)
+
+        // Antigravity credentials: T3 Code's ACP provider token file(s), then
+        // Antigravity CLI's (`agy`) login Keychain item.
+        var candidates: [AntigravityCredentials.Token] = []
+        let t3Base = NSHomeDirectory() + "/.t3/userdata/providers/antigravity"
+        for entry in (try? FileManager.default.contentsOfDirectory(atPath: t3Base)) ?? [] {
+            let p = "\(t3Base)/\(entry)/antigravity-acp/antigravity-oauth-token"
+            guard let data = FileManager.default.contents(atPath: p) else { continue }
+            if let creds = try? JSONDecoder().decode(AntigravityCredentials.self, from: data) {
+                candidates.append(creds.token)
+            } else {
+                error = "Auth format"
+            }
+        }
+        if let creds = readAntigravityKeychainCredentials() {
+            candidates.append(creds.token)
+        }
+        let expiry: (AntigravityCredentials.Token) -> Date = {
+            $0.expiry.flatMap(self.parseISO) ?? .distantFuture
+        }
+        candidates.sort { expiry($0) > expiry($1) }
+
+        if let best = candidates.first, expiry(best) > cutoff {
+            return GeminiAuth(token: best.accessToken, useDailyEndpoint: true, refreshToken: best.refreshToken)
+        }
+        if !candidates.isEmpty { error = "Auth expired" }
+
+        // All stored access tokens are expired: reuse or mint our own.
+        let refreshTokens = candidates.compactMap(\.refreshToken)
+        if let r = geminiRefreshed, r.expiry > cutoff, refreshTokens.contains(r.refreshToken) {
+            return GeminiAuth(token: r.token, useDailyEndpoint: true, refreshToken: r.refreshToken)
+        }
+        for rt in refreshTokens {
+            let r = await refreshGeminiToken(rt)
+            if let token = r.token {
+                return GeminiAuth(token: token, useDailyEndpoint: true, refreshToken: rt)
+            }
+            error = r.error ?? error
+        }
+
+        // Fallback: Gemini CLI plaintext OAuth credentials.
+        let geminiPath = NSHomeDirectory() + "/.gemini/oauth_creds.json"
+        if let data = FileManager.default.contents(atPath: geminiPath) {
+            if let creds = try? JSONDecoder().decode(GeminiCLICredentials.self, from: data) {
+                if !creds.isExpired { return GeminiAuth(token: creds.accessToken, useDailyEndpoint: false) }
+                if error == "No auth" { error = "Auth expired" }
+            } else if error == "No auth" {
+                error = "Auth format"
+            }
+        }
+
+        return GeminiAuth(token: nil, useDailyEndpoint: true, error: error)
+    }
+
+    /// Exchanges Antigravity's refresh token for a new access token.
+    ///
+    /// Google does not rotate refresh tokens on this grant (verified 2026-11-23:
+    /// the response carries no new refresh_token), so T3 and `agy` stay logged
+    /// in. The result lives in memory only.
+    private func refreshGeminiToken(_ refreshToken: String) async -> (token: String?, error: String?) {
+        let clientPath = NSHomeDirectory() + "/.config/usagebar/gemini-oauth-client.json"
+        guard let data = FileManager.default.contents(atPath: clientPath),
+              let client = try? JSONDecoder().decode(GoogleOAuthClient.self, from: data) else {
+            authLog.info("Gemini token expired and no OAuth client config at \(clientPath, privacy: .public)")
+            return (nil, "Auth expired")
+        }
+        var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        var form = URLComponents()
+        form.queryItems = [
+            URLQueryItem(name: "client_id", value: client.clientId),
+            URLQueryItem(name: "client_secret", value: client.clientSecret),
+            URLQueryItem(name: "refresh_token", value: refreshToken),
+            URLQueryItem(name: "grant_type", value: "refresh_token"),
+        ]
+        // URLComponents leaves "+" unescaped, which form decoding reads as a space.
+        let body = (form.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B")
+        req.httpBody = Data(body.utf8)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                authLog.error("Gemini token refresh failed with HTTP \(status, privacy: .public)")
+                // 400 invalid_grant: the login itself is gone; re-login needed.
+                return (nil, status == 400 || status == 401 ? "Login expired" : "Refresh \(status)")
+            }
+            let r = try JSONDecoder().decode(GoogleTokenResponse.self, from: data)
+            let expiry = Date().addingTimeInterval(r.expiresIn ?? 3600)
+            geminiRefreshed = (r.accessToken, expiry, refreshToken)
+            authLog.info("Gemini access token refreshed")
+            return (r.accessToken, nil)
+        } catch {
+            return (nil, "Network")
+        }
+    }
+
+    /// Reads Antigravity CLI's OAuth credentials from the login Keychain.
+    ///
+    /// Antigravity CLI uses go-keyring, which calls /usr/bin/security under the
+    /// hood, so reading via /usr/bin/security triggers no authorization prompt.
+    private func readAntigravityKeychainCredentials() -> AntigravityCredentials? {
+        guard var text = runSecurityFindPassword(service: "gemini", account: "antigravity") else {
+            return nil
+        }
+        let prefix = "go-keyring-base64:"
+        if text.hasPrefix(prefix) {
+            guard let decoded = Data(base64Encoded: String(text.dropFirst(prefix.count))),
+                  let decodedStr = String(data: decoded, encoding: .utf8) else {
+                authLog.error("Antigravity Keychain item has invalid base64 payload")
+                return nil
+            }
+            text = decodedStr
+        }
+        guard let creds = try? JSONDecoder().decode(AntigravityCredentials.self, from: Data(text.utf8)) else {
+            authLog.error("Antigravity Keychain item is not in the expected credentials format")
+            return nil
+        }
+        return creds
+    }
+
+    private func runSecurityFindPassword(service: String, account: String) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-a", account, "-w", "-s", service]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do {
+            try p.run()
+        } catch {
+            authLog.error("could not run /usr/bin/security: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+        let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: watchdog)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        watchdog.cancel()
+
+        guard p.terminationStatus == 0 else {
+            authLog.info("Keychain lookup for \(service, privacy: .public) exited with status \(p.terminationStatus, privacy: .public)")
+            return nil
+        }
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func parseISO(_ s: String) -> Date? {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -483,6 +888,11 @@ struct ProviderRow: View {
                     Text(staleLabel(fetchedAt, now: now))
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
+                }
+                if let reason = usage.staleReason {
+                    Text(reason)
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
                 }
             }
 
@@ -573,6 +983,7 @@ struct ContentView: View {
 
             ProviderRow(name: "Claude", usage: state.claude, now: now)
             ProviderRow(name: "Codex", usage: state.codex, now: now).padding(.top, 4)
+            ProviderRow(name: "Gemini", usage: state.gemini, now: now).padding(.top, 4)
 
             Divider()
 
@@ -613,7 +1024,7 @@ struct ContentView: View {
 
 class Panel: NSPanel {
     init() {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 280, height: 200),
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 280, height: 240),
                    styleMask: [.nonactivatingPanel, .fullSizeContentView],
                    backing: .buffered, defer: false)
         isFloatingPanel = true
@@ -667,7 +1078,8 @@ enum CLI {
         } else {
             asOf = ""
         }
-        var lines = ["\u{1B}[1m\(name)\u{1B}[0m\(asOf)"]
+        let reason = u.staleReason.map { " \u{1B}[33m\($0)\u{1B}[0m" } ?? ""
+        var lines = ["\u{1B}[1m\(name)\u{1B}[0m\(asOf)\(reason)"]
         if let e = u.error {
             lines.append("  \u{1B}[31m\(e)\u{1B}[0m")
         } else {
@@ -697,7 +1109,8 @@ enum CLI {
             var out = once ? "" : "\u{1B}[H\u{1B}[2J"
             out += "\u{1B}[1mUsage\u{1B}[0m \u{1B}[2m\(f.string(from: now))\u{1B}[0m\n\n"
             out += section("Claude", state.claude, now: now) + "\n\n"
-            out += section("Codex", state.codex, now: now) + "\n"
+            out += section("Codex", state.codex, now: now) + "\n\n"
+            out += section("Gemini", state.gemini, now: now) + "\n"
             print(out, terminator: "")
             fflush(stdout)
             if once { exit(0) }

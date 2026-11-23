@@ -1,6 +1,6 @@
 # UsageBar
 
-A lightweight macOS menu bar app that displays your Claude Code and OpenAI Codex usage at a glance.
+A lightweight macOS menu bar app that displays your Claude Code, OpenAI Codex, and Gemini usage at a glance.
 
 ![macOS](https://img.shields.io/badge/macOS-14%2B-blue)
 ![Swift](https://img.shields.io/badge/Swift-5.9-orange)
@@ -91,6 +91,10 @@ When no source is fresh, the panel keeps the last good data, dimmed and labelled
 ### Codex (OpenAI)
 
 Authenticate with Codex CLI first. This creates `~/.codex/auth.json`.
+
+### Gemini (Antigravity / Gemini CLI)
+
+UsageBar reads the active Antigravity OAuth access token (from T3 Code's Antigravity provider or Antigravity CLI's login Keychain item `gemini`/`antigravity`, read via `/usr/bin/security`), with an optional `~/.config/usagebar/gemini-token` override and `~/.gemini/oauth_creds.json` fallback, and queries Google's Cloud Code quota summary endpoint (`retrieveUserQuotaSummary`, falling back to `retrieveUserQuota`) for 5h, 7d, and model-scoped Gemini limits. When those access tokens have expired (T3 / `agy` not used for an hour), UsageBar refreshes one itself from Antigravity's refresh token and keeps it in memory; nothing is written back. This needs Antigravity's OAuth client in `~/.config/usagebar/gemini-oauth-client.json` (`{"client_id": "...", "client_secret": "..."}`, mode 0600). The values ship inside the Antigravity CLI binary and are not part of this repo. Without the file, Gemini shows "Auth expired" once the tokens run out.
 
 ## SwiftBar / xbar Integration
 
