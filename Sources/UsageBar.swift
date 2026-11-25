@@ -250,18 +250,35 @@ class UsageAPI {
     private var lastGoodClaude: ProviderUsage?
     private var lastGoodCodex: ProviderUsage?
     private var lastGoodGemini: ProviderUsage?
-    private var claudeBackoffUntil = Date.distantPast
-    private var codexBackoffUntil = Date.distantPast
-    private var geminiBackoffUntil = Date.distantPast
+    private var claudeBackoff = Backoff()
+    private var codexBackoff = Backoff()
+    private var geminiBackoff = Backoff()
     /// Access token UsageBar minted itself from Antigravity's refresh token.
     /// Kept in memory only; T3's file and the Keychain item stay untouched.
     private var geminiRefreshed: (token: String, expiry: Date, refreshToken: String)?
+    /// Access tokens the quota API answered with 403 (e.g. an `agy` login whose
+    /// account has no Cloud Code access). Skipped until they rotate.
+    private var geminiRejected: Set<String> = []
 
     private let cacheURL = URL(fileURLWithPath: NSHomeDirectory() + "/.cache/usagebar-state.json")
     // Serve from the shared cache while it is fresher than this, so N running
     // instances still produce only ~1 API request per interval in total.
     private let cacheMaxAge: TimeInterval = 55
-    private let backoffInterval: TimeInterval = 300
+    // Anthropic's usage endpoint rate-limits a token that is polled every
+    // minute (429 with retry-after: 0, observed 2026-11-25 for 10+ minutes),
+    // and the weekly numbers move slowly, so Claude is polled less often.
+    private let claudeCacheMaxAge: TimeInterval = 175
+
+    /// 429 backoff that doubles while the API keeps refusing: 5, 10, 20, 30 min.
+    struct Backoff {
+        var until = Date.distantPast
+        var streak = 0
+        mutating func hit() {
+            streak += 1
+            until = Date().addingTimeInterval(min(300 * pow(2, Double(streak - 1)), 1800))
+        }
+        mutating func reset() { streak = 0; until = .distantPast }
+    }
 
     func fetchAll() async -> AppState {
         var state = AppState()
@@ -279,35 +296,37 @@ class UsageAPI {
             writeCache { $0.claude = CachedProvider(usage: local, fetchedAt: fetchedAt) }
         } else {
             state.claude = await fetchProvider(
-                cached: cache?.claude, lastGood: &lastGoodClaude, backoffUntil: &claudeBackoffUntil,
+                cached: cache?.claude, maxAge: claudeCacheMaxAge,
+                lastGood: &lastGoodClaude, backoff: &claudeBackoff,
                 fetch: { await self.fetchClaude(auth: auth) },
                 store: { c in self.writeCache { $0.claude = c } })
         }
         state.codex = await fetchProvider(
-            cached: cache?.codex, lastGood: &lastGoodCodex, backoffUntil: &codexBackoffUntil,
+            cached: cache?.codex, lastGood: &lastGoodCodex, backoff: &codexBackoff,
             fetch: fetchCodex, store: { c in self.writeCache { $0.codex = c } })
         state.gemini = await fetchProvider(
-            cached: cache?.gemini, lastGood: &lastGoodGemini, backoffUntil: &geminiBackoffUntil,
+            cached: cache?.gemini, lastGood: &lastGoodGemini, backoff: &geminiBackoff,
             fetch: fetchGemini, store: { c in self.writeCache { $0.gemini = c } })
 
         return state
     }
 
     private func fetchProvider(cached: CachedProvider?,
+                               maxAge: TimeInterval? = nil,
                                lastGood: inout ProviderUsage?,
-                               backoffUntil: inout Date,
+                               backoff: inout Backoff,
                                fetch: () async -> ProviderUsage,
                                store: (CachedProvider) -> Void) async -> ProviderUsage {
         let now = Date()
         // Another instance fetched moments ago — reuse its result.
-        if let c = cached, now.timeIntervalSince(c.fetchedAt) < cacheMaxAge {
+        if let c = cached, now.timeIntervalSince(c.fetchedAt) < (maxAge ?? cacheMaxAge) {
             var usage = c.usage
             usage.fetchedAt = usage.fetchedAt ?? c.fetchedAt
             lastGood = usage
             return usage
         }
         // Backing off after a 429 — show the best data we have.
-        if now < backoffUntil, var usage = lastGood ?? cached?.usage {
+        if now < backoff.until, var usage = lastGood ?? cached?.usage {
             usage.fetchedAt = usage.fetchedAt ?? cached?.fetchedAt
             usage.staleReason = "Rate limit"
             return usage
@@ -315,7 +334,9 @@ class UsageAPI {
 
         let fetched = await fetch()
         if fetched.shouldBackoff || fetched.error == "Rate limit" {
-            backoffUntil = Date().addingTimeInterval(backoffInterval)
+            backoff.hit()
+        } else if fetched.error == nil {
+            backoff.reset()
         }
         if fetched.error == nil {
             lastGood = fetched
@@ -527,6 +548,17 @@ class UsageAPI {
     private func fetchGemini() async -> ProviderUsage {
         var auth = await fetchGeminiAccessToken()
         var u = await fetchGeminiUsage(auth: auth)
+        // Several Antigravity logins can be present (T3 file, `agy` Keychain).
+        // The one that expires last may still be refused with 403, so fall back
+        // to the next candidate instead of showing the error.
+        while u.error == "API 403", let rejected = auth.token, !geminiRejected.contains(rejected) {
+            geminiRejected.insert(rejected)
+            authLog.info("Gemini quota API refused a token with 403, trying the next one")
+            let next = await fetchGeminiAccessToken()
+            guard next.token != nil else { break }
+            auth = next
+            u = await fetchGeminiUsage(auth: auth)
+        }
         // Token revoked or expired early: mint a fresh one once and retry.
         if u.error == "API 401", let rt = auth.refreshToken {
             geminiRefreshed = nil
@@ -730,6 +762,7 @@ class UsageAPI {
         if let creds = readAntigravityKeychainCredentials() {
             candidates.append(creds.token)
         }
+        candidates.removeAll { geminiRejected.contains($0.accessToken) }
         let expiry: (AntigravityCredentials.Token) -> Date = {
             $0.expiry.flatMap(self.parseISO) ?? .distantFuture
         }
@@ -742,7 +775,8 @@ class UsageAPI {
 
         // All stored access tokens are expired: reuse or mint our own.
         let refreshTokens = candidates.compactMap(\.refreshToken)
-        if let r = geminiRefreshed, r.expiry > cutoff, refreshTokens.contains(r.refreshToken) {
+        if let r = geminiRefreshed, r.expiry > cutoff, refreshTokens.contains(r.refreshToken),
+           !geminiRejected.contains(r.token) {
             return GeminiAuth(token: r.token, useDailyEndpoint: true, refreshToken: r.refreshToken)
         }
         for rt in refreshTokens {
